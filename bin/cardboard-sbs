@@ -1,0 +1,91 @@
+#!/bin/sh
+# Turn the monitor into a Cardboard side-by-side picture for streaming to a phone.
+# usage: cardboard-sbs on | off | toggle (default)
+#        cardboard-sbs auto [class]   split only while that window is focused and fullscreen
+#        cardboard-sbs stop           end auto and turn the split off
+# The Sunshine "Cardboard" app runs auto at stream start and stop at the end.
+
+share="${XDG_DATA_HOME:-$HOME/.local/share}/hypr-cardboard"
+run="${XDG_RUNTIME_DIR:-/tmp}"
+shader="$run/cardboard-sbs.frag"
+pidfile="$run/cardboard-sbs.pid"
+class="${2:-${CARDBOARD_CLASS:-Liftoff.x86_64}}"
+
+# Fill in the focused monitor's aspect ratio (rotated monitors swap sides).
+make_shader() {
+    aspect="$(hyprctl monitors -j | python3 -c '
+import json, sys
+m = next(m for m in json.load(sys.stdin) if m["focused"])
+w, h = m["width"], m["height"]
+if m["transform"] % 2: w, h = h, w
+print(f"{w}.0 / {h}.0")')" || return 1
+    sed "s|16.0 / 9.0; // @ASPECT@|$aspect;|" "$share/cardboard.frag" >"$shader"
+}
+
+# A hardware cursor is drawn after the shader, so it would not be split.
+# While split, draw the cursor in software so it lands in both eyes.
+set_shader() {
+    if [ -n "$1" ]; then sw=true; else sw=false; fi
+    hyprctl eval "hl.config({ decoration = { screen_shader = \"$1\" }, cursor = { no_hardware_cursors = $sw } })" >/dev/null
+}
+
+case "${1:-toggle}" in
+on) make_shader && set_shader "$shader" ;;
+off) set_shader "" ;;
+toggle)
+    current="$(hyprctl getoption decoration:screen_shader | awk '/^str:/ {print $2}')"
+    if [ -n "$current" ]; then set_shader ""; else make_shader && set_shader "$shader"; fi
+    ;;
+auto)
+    make_shader || exit 1
+    echo $$ >"$pidfile"
+    trap 'set_shader ""; rm -f "$pidfile"' EXIT
+    trap 'exit 0' INT TERM
+    # Hyprland's event socket: recheck on every focus, fullscreen or window change.
+    SHADER="$shader" CLASS="$class" python3 -u - <<'PY'
+import json, os, socket, subprocess
+
+def hc(*args):
+    return json.loads(subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True).stdout)
+
+# The shader splits the whole monitor, so only split while the game fills it.
+def game_showing():
+    w = hc("activewindow")
+    return w.get("class") == os.environ["CLASS"] and w.get("fullscreen", 0) == 2
+
+def set_shader(path):
+    sw = "true" if path else "false"
+    subprocess.run(["hyprctl", "eval", f'hl.config({{ decoration = {{ screen_shader = "{path}" }}, cursor = {{ no_hardware_cursors = {sw} }} }})'],
+                   stdout=subprocess.DEVNULL)
+
+events = {"workspace", "workspacev2", "focusedmon", "activewindow", "fullscreen", "openwindow", "closewindow", "movewindow", "movewindowv2"}
+sock = socket.socket(socket.AF_UNIX)
+sock.connect(f'{os.environ["XDG_RUNTIME_DIR"]}/hypr/{os.environ["HYPRLAND_INSTANCE_SIGNATURE"]}/.socket2.sock')
+
+state = None
+buf = b""
+lines = []
+while True:
+    if state is None or any(line.split(b">>")[0].decode() in events for line in lines):
+        want = game_showing()
+        if want != state:
+            set_shader(os.environ["SHADER"] if want else "")
+            state = want
+    data = sock.recv(4096)
+    if not data:
+        break
+    buf += data
+    *lines, buf = buf.split(b"\n")
+PY
+    ;;
+stop)
+    if [ -f "$pidfile" ]; then
+        # The shell waits on the watcher, so end the watcher first.
+        pkill -P "$(cat "$pidfile")" 2>/dev/null
+        kill "$(cat "$pidfile")" 2>/dev/null
+        rm -f "$pidfile"
+    fi
+    set_shader ""
+    ;;
+*) echo "usage: cardboard-sbs on | off | toggle | auto [class] | stop"; exit 1 ;;
+esac
