@@ -79,6 +79,33 @@ Example keybind for `hyprland.lua`:
 hl.bind("SUPER + SHIFT + V", hl.dsp.exec_cmd("cardboard-sbs toggle"))
 ```
 
+## Phone viewer and calibration
+
+`phone/index.html` is a single page that runs in the phone's browser, no
+install and no network. It does two things:
+
+- **Calibrate the headset.** A test grid, drawn once per eye, with sliders
+  for eye spacing (mm), lens correction (k1, k2), zoom, up/down and screen
+  scale. Adjust until the lines look straight and both eyes merge into one
+  sharp picture. The values stay on the phone and are shown at the bottom.
+- **View any picture or video Cardboard-style.** *Open file* picks one from
+  the phone's gallery. If the file is already side-by-side 3D, tick the box
+  and each eye gets its own half: real 3D.
+
+*Fullscreen* also locks landscape. Tap the picture to show or hide the
+settings.
+
+Open it from a local server on the phone, for example in Termux:
+
+```sh
+cd hypr-cardboard/phone && python3 -m http.server 8090 --bind 127.0.0.1
+# then open http://127.0.0.1:8090/ in the browser
+```
+
+The starting values are a guess for a generic plastic VR box (approx.); the
+sliders are the real calibration. The PC split shader doesn't use these
+values yet.
+
 ## How it works
 
 ```

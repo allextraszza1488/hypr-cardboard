@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Cardboard viewer</title>
+<style>
+  /* 0xyc: black, cream, greys */
+  :root { --bg:#000; --fg:#e8e4dc; --mid:#8a877f; --line:#3a3a38; --dim:#2a2a28; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:14px/1.4 ui-monospace, "JetBrains Mono", monospace; overflow:hidden; touch-action:none; }
+  canvas { position:fixed; inset:0; width:100vw; height:100dvh; display:block; }
+  #panel { position:fixed; inset:auto 0 0 0; max-height:85dvh; overflow:auto;
+    padding:12px 16px calc(12px + env(safe-area-inset-bottom)); background:rgba(0,0,0,.88);
+    border-top:1px solid var(--line); }
+  #panel[hidden] { display:none; }
+  .row { display:grid; grid-template-columns:9.5em 1fr 4.5em; gap:10px; align-items:center; margin:6px 0; }
+  .row span:last-child { text-align:right; color:var(--mid); }
+  input[type=range] { width:100%; accent-color:var(--fg); }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 4px; }
+  button, label.btn { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+    padding:9px 12px; font:inherit; letter-spacing:.04em; cursor:pointer; }
+  button:active, label.btn:active { background:var(--dim); }
+  label.check { display:flex; gap:8px; align-items:center; margin:8px 0; color:var(--mid); }
+  #out { white-space:pre-wrap; color:var(--mid); margin-top:8px; user-select:all; }
+  .hint { color:var(--mid); margin:2px 0 8px; }
+  #tap { position:fixed; top:calc(8px + env(safe-area-inset-top)); left:50%; transform:translateX(-50%);
+    color:var(--mid); font-size:12px; pointer-events:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="tap">tap to show / hide settings</div>
+
+<div id="panel">
+  <div class="hint">Phone in landscape, in the headset. Adjust until the grid looks straight and both eyes
+    merge into one sharp picture.</div>
+  <div class="row"><span>Eye spacing</span><input id="ipd" type="range" min="50" max="75" step="0.5"><span id="ipdV"></span></div>
+  <div class="row"><span>Lens bend k1</span><input id="k1" type="range" min="0" max="0.8" step="0.01"><span id="k1V"></span></div>
+  <div class="row"><span>Lens bend k2</span><input id="k2" type="range" min="0" max="0.8" step="0.01"><span id="k2V"></span></div>
+  <div class="row"><span>Zoom</span><input id="zoom" type="range" min="0.4" max="2.5" step="0.01"><span id="zoomV"></span></div>
+  <div class="row"><span>Up / down</span><input id="voff" type="range" min="-20" max="20" step="0.5"><span id="voffV"></span></div>
+  <div class="row"><span>Screen scale</span><input id="scale" type="range" min="0.85" max="1.15" step="0.005"><span id="scaleV"></span></div>
+  <label class="check"><input id="sbs" type="checkbox"> File is already side-by-side 3D (left half → left eye)</label>
+  <div class="btns">
+    <label class="btn">Open file<input id="file" type="file" accept="image/*,video/*" hidden></label>
+    <button id="grid">Test grid</button>
+    <button id="play" hidden>Pause</button>
+    <button id="full">Fullscreen</button>
+    <button id="reset">Reset</button>
+  </div>
+  <div id="out"></div>
+</div>
+
+<script>
+'use strict';
+// Cardboard viewer: any picture or video, drawn once per eye with the lens
+// pre-distortion a Cardboard-style headset needs. Values persist on this phone.
+
+// Generic plastic VR box starting point (approx.); the sliders do the rest.
+const DEFAULTS = { ipd: 63, k1: 0.22, k2: 0.10, zoom: 1.0, voff: 0, scale: 1.0, sbs: false };
+// Android lays out CSS pixels at ~160 per inch; "Screen scale" corrects the rest.
+const CSS_PX_PER_MM = 160 / 25.4;
+const KEY = 'cardboard-viewer';
+
+const $ = (id) => document.getElementById(id);
+let s = { ...DEFAULTS };
+try { Object.assign(s, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch {}
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(s)); } catch {} };
+
+const canvas = $('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false });
+if (!gl) { document.body.textContent = 'WebGL is not available in this browser.'; throw new Error('no webgl'); }
+
+const vs = `attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+const fs = `precision highp float;
+uniform sampler2D tex;
+uniform vec2 uCenterL, uCenterR; // eye centres, device px (GL origin bottom-left)
+uniform float uR;                // eye radius, device px
+uniform float uHalf;             // screen middle, device px
+uniform vec2 uK;                 // k1, k2
+uniform float uZoom;
+uniform vec2 uExt;               // content half-extents in eye units (fit inside the eye)
+uniform float uSbs;              // 1: left half of the source is the left eye
+void main(){
+  bool left = gl_FragCoord.x < uHalf;
+  vec2 c = left ? uCenterL : uCenterR;
+  vec2 p = (gl_FragCoord.xy - c) / uR;
+  float r2 = dot(p, p);
+  // barrel pre-distortion: the lens' pincushion straightens it out again
+  vec2 q = p * (1.0 + uK.x * r2 + uK.y * r2 * r2);
+  vec2 uv = 0.5 + q / (2.0 * uZoom * uExt);
+  uv.y = 1.0 - uv.y;
+  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || r2 > 1.6) {
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+  if (uSbs > 0.5) uv.x = uv.x * 0.5 + (left ? 0.0 : 0.5);
+  float fade = 1.0 - smoothstep(1.3, 1.6, r2); // soft edge where the lens ends
+  gl_FragColor = vec4(texture2D(tex, uv).rgb * fade, 1.0);
+}`;
+function shader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, shader(gl.VERTEX_SHADER, vs));
+gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+const U = (n) => gl.getUniformLocation(prog, n);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+// non-power-of-two safe in WebGL 1
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+// ---- content: test grid, picture or video
+let source = null, srcW = 1, srcH = 1, video = null, url = null;
+
+function testGrid() {
+  const n = 1024, g = document.createElement('canvas');
+  g.width = g.height = n;
+  const x = g.getContext('2d');
+  x.fillStyle = '#000'; x.fillRect(0, 0, n, n);
+  x.strokeStyle = '#3a3a38'; x.lineWidth = 2;
+  for (let i = 0; i <= n; i += 64) {
+    x.beginPath(); x.moveTo(i, 0); x.lineTo(i, n); x.stroke();
+    x.beginPath(); x.moveTo(0, i); x.lineTo(n, i); x.stroke();
+  }
+  x.strokeStyle = '#e8e4dc'; x.lineWidth = 3;
+  for (const r of [128, 256, 384, 500]) { x.beginPath(); x.arc(n / 2, n / 2, r, 0, Math.PI * 2); x.stroke(); }
+  x.beginPath(); x.moveTo(n / 2, 0); x.lineTo(n / 2, n); x.moveTo(0, n / 2); x.lineTo(n, n / 2); x.stroke();
+  x.fillStyle = '#e8e4dc'; x.font = 'bold 44px monospace'; x.textAlign = 'center';
+  x.fillText('straight lines?', n / 2, 110);
+  x.fillText('one picture?', n / 2, n - 80);
+  return g;
+}
+function setSource(el, w, h) {
+  source = el; srcW = w; srcH = h;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, el);
+  draw();
+}
+function stopVideo() {
+  if (video) { video.pause(); video.removeAttribute('src'); video.load(); video = null; }
+  if (url) { URL.revokeObjectURL(url); url = null; }
+  $('play').hidden = true;
+}
+function showGrid() { stopVideo(); const g = testGrid(); setSource(g, g.width, g.height); }
+
+$('file').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  stopVideo();
+  url = URL.createObjectURL(f);
+  if (f.type.startsWith('video/')) {
+    video = document.createElement('video');
+    Object.assign(video, { src: url, loop: true, playsInline: true, muted: false });
+    video.addEventListener('loadeddata', () => { setSource(video, video.videoWidth, video.videoHeight); tick(); });
+    video.play().catch(() => { video.muted = true; video.play(); });
+    $('play').hidden = false; $('play').textContent = 'Pause';
+  } else {
+    const img = new Image();
+    img.onload = () => setSource(img, img.naturalWidth, img.naturalHeight);
+    img.src = url;
+  }
+  e.target.value = '';
+});
+function tick() {
+  if (!video) return;
+  if (video.readyState >= 2) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    draw();
+  }
+  requestAnimationFrame(tick);
+}
+$('play').addEventListener('click', () => {
+  if (!video) return;
+  if (video.paused) { video.play(); $('play').textContent = 'Pause'; }
+  else { video.pause(); $('play').textContent = 'Play'; }
+});
+
+// ---- drawing
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+  }
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  const pxmm = CSS_PX_PER_MM * s.scale * dpr; // device px per mm
+  const half = canvas.width / 2;
+  const ipd = s.ipd * pxmm;
+  const cy = canvas.height / 2 - s.voff * pxmm;  // GL y runs up; positive = picture moves down
+  const R = Math.min(half, canvas.height) / 2;
+  gl.uniform2f(U('uCenterL'), half - ipd / 2, cy);
+  gl.uniform2f(U('uCenterR'), half + ipd / 2, cy);
+  gl.uniform1f(U('uR'), R);
+  gl.uniform1f(U('uHalf'), half);
+  gl.uniform2f(U('uK'), s.k1, s.k2);
+  gl.uniform1f(U('uZoom'), s.zoom);
+  const a = (s.sbs ? srcW / 2 : srcW) / srcH; // aspect of one eye's picture
+  gl.uniform2f(U('uExt'), a >= 1 ? 1 : a, a >= 1 ? 1 / a : 1);
+  gl.uniform1f(U('uSbs'), s.sbs ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// ---- controls
+const fmt = { ipd: (v) => v.toFixed(1) + ' mm', k1: (v) => v.toFixed(2), k2: (v) => v.toFixed(2),
+  zoom: (v) => '×' + v.toFixed(2), voff: (v) => (v > 0 ? '+' : '') + v.toFixed(1) + ' mm', scale: (v) => '×' + v.toFixed(3) };
+function sync() {
+  for (const k of Object.keys(fmt)) { $(k).value = s[k]; $(k + 'V').textContent = fmt[k](+s[k]); }
+  $('sbs').checked = !!s.sbs;
+  $('out').textContent = `ipd_mm=${s.ipd} k1=${s.k1} k2=${s.k2} zoom=${s.zoom} voff_mm=${s.voff} scale=${s.scale}`;
+}
+for (const k of Object.keys(fmt)) {
+  $(k).addEventListener('input', () => { s[k] = +$(k).value; save(); sync(); draw(); });
+}
+$('sbs').addEventListener('change', () => { s.sbs = $('sbs').checked; save(); draw(); });
+$('grid').addEventListener('click', showGrid);
+$('reset').addEventListener('click', () => { s = { ...DEFAULTS }; save(); sync(); draw(); });
+$('full').addEventListener('click', async () => {
+  try {
+    await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+    await screen.orientation.lock('landscape');
+  } catch {}
+  $('panel').hidden = true;
+  $('tap').hidden = true;
+});
+canvas.addEventListener('click', () => { $('panel').hidden = !$('panel').hidden; $('tap').hidden = true; });
+window.addEventListener('resize', draw);
+
+sync();
+showGrid();
+</script>
+</body>
+</html>
