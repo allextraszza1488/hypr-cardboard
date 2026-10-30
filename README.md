@@ -26,7 +26,7 @@ FPV sims like Liftoff, but any game works.
 ## Install
 
 ```sh
-git clone https://github.com/allextraszza1488/hypr-cardboard
+git clone https://github.com/GraceHoppa/hypr-cardboard
 cd hypr-cardboard
 ./install.sh
 systemctl --user restart sunshine
